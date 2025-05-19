@@ -80,6 +80,10 @@ docker build -t bad-proxy .
 docker run -p 8080:8080 -p 8070:8070 -e BACKEND_URL=http://your-api-server.com bad-proxy
 ```
 
+# TXN2 Docker Image
+
+- `txn2/bad-proxy:1.0.0`
+
 ## Use Cases
 
 - Testing client retry logic
@@ -122,11 +126,3 @@ go build -o bad-proxy cmd/server/main.go
 ## License
 
 [MIT License](LICENSE)
-
-
-# Docker
-
-```shell
-docker build -t txn2/bad-proxy:1.0.0 .
-docker push txn2/bad-proxy:1.0.0
-```
