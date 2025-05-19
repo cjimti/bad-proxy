@@ -60,7 +60,7 @@ Updates the proxy behavior configuration.
 
 **Request Body:**
 
-```json
+```plain
 {
   "latency": 2,        // Added delay in seconds
   "500": 0.1,          // Probability of returning 500 errors (0.0-1.0)
