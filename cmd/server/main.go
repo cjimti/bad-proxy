@@ -33,47 +33,49 @@ var (
 )
 
 type ProxyConfig struct {
-	Latency         int     `json:"latency"`
-	ConnectLatency  int     `json:"connect_latency"`
-	NoBackend       float64 `json:"no_backend"`
-	Error500        float64 `json:"500"`
-	Error400        float64 `json:"400"`
-	Disconnect      float64 `json:"disconnect"`
-	Corrupt         float64 `json:"corrupt"`
-	ErrorWindowSize int     `json:"error_window_size"`
+	Latency        int     `json:"latency"`
+	ConnectLatency int     `json:"connect_latency"`
+	NoBackend      float64 `json:"no_backend"`
+	Error500       float64 `json:"500"`
+	Error400       float64 `json:"400"`
+	Disconnect     float64 `json:"disconnect"`
+	Corrupt        float64 `json:"corrupt"`
+	WindowSize     int     `json:"error_window_size"`
+	ForceErrors    bool    `json:"force_errors"`
 }
 
-type ErrorTracker struct {
-	WindowSize     int
-	RequestCounter int
-	ErrorBuckets   map[string][]bool
+type ErrorStats struct {
+	Total           int                `json:"total_requests"`
+	SuccessCount    int                `json:"success_count"`
+	NoBackendCount  int                `json:"no_backend_count"`
+	Error500Count   int                `json:"error_500_count"`
+	Error400Count   int                `json:"error_400_count"`
+	DisconnectCount int                `json:"disconnect_count"`
+	CorruptCount    int                `json:"corrupt_count"`
+	CurrentRates    map[string]float64 `json:"current_rates"`
+	RecentErrors    []string           `json:"recent_errors"`
+	RecentTotal     int                `json:"recent_total"`
 }
 
 var (
 	config = ProxyConfig{
-		Latency:         0,
-		ConnectLatency:  0,
-		NoBackend:       0,
-		Error500:        0,
-		Error400:        0,
-		Disconnect:      0,
-		Corrupt:         0,
-		ErrorWindowSize: 100,
+		Latency:        0,
+		ConnectLatency: 0,
+		NoBackend:      0,
+		Error500:       0,
+		Error400:       0,
+		Disconnect:     0,
+		Corrupt:        0,
+		WindowSize:     100,
+		ForceErrors:    true,
 	}
 	configMutex sync.RWMutex
 
-	errorTracker = ErrorTracker{
-		WindowSize:     100,
-		RequestCounter: 0,
-		ErrorBuckets: map[string][]bool{
-			"error500":   make([]bool, 100),
-			"error400":   make([]bool, 100),
-			"disconnect": make([]bool, 100),
-			"corrupt":    make([]bool, 100),
-			"no_backend": make([]bool, 100),
-		},
+	stats = ErrorStats{
+		RecentErrors: make([]string, 100),
+		CurrentRates: make(map[string]float64),
 	}
-	trackerMutex sync.RWMutex
+	statsMutex sync.RWMutex
 )
 
 func main() {
@@ -140,17 +142,26 @@ func main() {
 		currentConfig := config
 		configMutex.RUnlock()
 
-		trackerMutex.RLock()
-		errorRates := calculateCurrentErrorRates()
-		windowSize := errorTracker.WindowSize
-		requestsProcessed := errorTracker.RequestCounter
-		trackerMutex.RUnlock()
+		statsMutex.RLock()
+		currentStats := stats
+		statsMutex.RUnlock()
 
 		c.JSON(http.StatusOK, gin.H{
-			"config":             currentConfig,
-			"actual_rates":       errorRates,
-			"window_size":        windowSize,
-			"requests_processed": requestsProcessed,
+			"config": currentConfig,
+			"stats":  currentStats,
+		})
+	})
+
+	rCfg.GET("/reset-stats", func(c *gin.Context) {
+		statsMutex.Lock()
+		stats = ErrorStats{
+			RecentErrors: make([]string, config.WindowSize),
+			CurrentRates: make(map[string]float64),
+		}
+		statsMutex.Unlock()
+
+		c.JSON(http.StatusOK, gin.H{
+			"status": "Statistics reset successful",
 		})
 	})
 
@@ -161,23 +172,21 @@ func main() {
 			return
 		}
 
-		if newConfig.ErrorWindowSize <= 0 {
-			newConfig.ErrorWindowSize = 100
+		if newConfig.WindowSize <= 0 {
+			newConfig.WindowSize = 100
 		}
+
+		oldWindowSize := config.WindowSize
 
 		configMutex.Lock()
 		config = newConfig
 		configMutex.Unlock()
 
-		trackerMutex.Lock()
-		if errorTracker.WindowSize != newConfig.ErrorWindowSize {
-			errorTracker.WindowSize = newConfig.ErrorWindowSize
-			for errorType := range errorTracker.ErrorBuckets {
-				errorTracker.ErrorBuckets[errorType] = make([]bool, newConfig.ErrorWindowSize)
-			}
+		if oldWindowSize != newConfig.WindowSize {
+			statsMutex.Lock()
+			stats.RecentErrors = make([]string, newConfig.WindowSize)
+			statsMutex.Unlock()
 		}
-		resetErrorTrackers()
-		trackerMutex.Unlock()
 
 		logger.Info("Proxy configuration updated",
 			zap.Int("latency", newConfig.Latency),
@@ -187,7 +196,7 @@ func main() {
 			zap.Float64("400", newConfig.Error400),
 			zap.Float64("disconnect", newConfig.Disconnect),
 			zap.Float64("corrupt", newConfig.Corrupt),
-			zap.Int("error_window_size", newConfig.ErrorWindowSize),
+			zap.Int("window_size", newConfig.WindowSize),
 		)
 
 		c.JSON(http.StatusOK, gin.H{"status": "configuration updated"})
@@ -236,32 +245,93 @@ func proxyRequest(c *gin.Context, logger *zap.Logger) {
 	configMutex.RLock()
 	latency := config.Latency
 	connectLatency := config.ConnectLatency
-	noBackend := config.NoBackend
-	error500 := config.Error500
-	error400 := config.Error400
-	disconnect := config.Disconnect
-	corrupt := config.Corrupt
+	noBackendProb := config.NoBackend
+	error500Prob := config.Error500
+	error400Prob := config.Error400
+	disconnectProb := config.Disconnect
+	corruptProb := config.Corrupt
+	forceErrors := config.ForceErrors
+	windowSize := config.WindowSize
 	configMutex.RUnlock()
 
-	trackerMutex.Lock()
-	currentIndex := errorTracker.RequestCounter % errorTracker.WindowSize
-	errorTracker.RequestCounter++
+	statsMutex.Lock()
+	stats.Total++
+	recentPos := stats.Total % windowSize
+	if recentPos >= len(stats.RecentErrors) {
+		recentPos = len(stats.RecentErrors) - 1
+	}
 
-	shouldNoBackend := shouldTriggerError("no_backend", noBackend, currentIndex)
-	shouldError500 := shouldTriggerError("error500", error500, currentIndex)
-	shouldError400 := shouldTriggerError("error400", error400, currentIndex)
-	shouldDisconnect := shouldTriggerError("disconnect", disconnect, currentIndex)
-	shouldCorrupt := shouldTriggerError("corrupt", corrupt, currentIndex)
-	trackerMutex.Unlock()
+	var errorType string
+	applyError := false
+
+	if forceErrors {
+		successiveNoErrors := countSuccessiveNoErrors(stats.RecentErrors)
+		maxAllowedSuccessiveSuccess := calculateMaxAllowedSuccessive(disconnectProb, error500Prob, error400Prob, noBackendProb, corruptProb)
+
+		if successiveNoErrors >= maxAllowedSuccessiveSuccess && maxAllowedSuccessiveSuccess > 0 {
+			applyError = true
+			errorType = selectForcedErrorType(disconnectProb, error500Prob, error400Prob, noBackendProb, corruptProb)
+		}
+	}
+
+	if !applyError {
+		randomVal := rand.Float64()
+		cumulativeProb := 0.0
+
+		if disconnectProb > 0 {
+			cumulativeProb += disconnectProb
+			if randomVal < cumulativeProb {
+				errorType = "disconnect"
+				applyError = true
+			}
+		}
+
+		if !applyError && error500Prob > 0 {
+			cumulativeProb += error500Prob
+			if randomVal < cumulativeProb {
+				errorType = "error500"
+				applyError = true
+			}
+		}
+
+		if !applyError && error400Prob > 0 {
+			cumulativeProb += error400Prob
+			if randomVal < cumulativeProb {
+				errorType = "error400"
+				applyError = true
+			}
+		}
+
+		if !applyError && noBackendProb > 0 {
+			cumulativeProb += noBackendProb
+			if randomVal < cumulativeProb {
+				errorType = "no_backend"
+				applyError = true
+			}
+		}
+
+		if !applyError && corruptProb > 0 {
+			cumulativeProb += corruptProb
+			if randomVal < cumulativeProb {
+				errorType = "corrupt"
+				applyError = true
+			}
+		}
+	}
+
+	stats.RecentErrors[recentPos] = errorType
+	updateErrorStats(errorType, &stats)
+	updateErrorRates(&stats, windowSize)
+	statsMutex.Unlock()
 
 	if connectLatency > 0 {
 		time.Sleep(time.Duration(connectLatency) * time.Second)
 	}
 
-	if shouldDisconnect {
+	if errorType == "disconnect" {
 		logger.Info("Disconnecting based on configured probability",
-			zap.Int("request_num", errorTracker.RequestCounter),
-			zap.Float64("disconnect", disconnect))
+			zap.Int("request_num", stats.Total),
+			zap.Float64("disconnect", disconnectProb))
 
 		hijacker, ok := c.Writer.(http.Hijacker)
 		if !ok {
@@ -285,30 +355,30 @@ func proxyRequest(c *gin.Context, logger *zap.Logger) {
 		return
 	}
 
-	if shouldNoBackend {
+	if errorType == "no_backend" {
 		logger.Info("Preventing backend request based on configured probability",
-			zap.Int("request_num", errorTracker.RequestCounter),
-			zap.Float64("no_backend", noBackend))
+			zap.Int("request_num", stats.Total),
+			zap.Float64("no_backend", noBackendProb))
 
 		time.Sleep(time.Duration(latency) * time.Second)
 		c.JSON(http.StatusOK, gin.H{"message": "Response generated by Bad-Proxy without reaching backend"})
 		return
 	}
 
-	if shouldError400 {
+	if errorType == "error400" {
 		logger.Info("Returning 400 Bad Request based on configured probability",
-			zap.Int("request_num", errorTracker.RequestCounter),
-			zap.Float64("error400", error400))
+			zap.Int("request_num", stats.Total),
+			zap.Float64("error400", error400Prob))
 
 		time.Sleep(time.Duration(latency) * time.Second)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Bad request error generated by Bad-Proxy"})
 		return
 	}
 
-	if shouldError500 {
+	if errorType == "error500" {
 		logger.Info("Returning 500 Internal Server Error based on configured probability",
-			zap.Int("request_num", errorTracker.RequestCounter),
-			zap.Float64("error500", error500))
+			zap.Int("request_num", stats.Total),
+			zap.Float64("error500", error500Prob))
 
 		time.Sleep(time.Duration(latency) * time.Second)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Server error generated by Bad-Proxy"})
@@ -370,10 +440,10 @@ func proxyRequest(c *gin.Context, logger *zap.Logger) {
 
 	c.Status(resp.StatusCode)
 
-	if shouldCorrupt {
+	if errorType == "corrupt" {
 		logger.Info("Corrupting response based on configured probability",
-			zap.Int("request_num", errorTracker.RequestCounter),
-			zap.Float64("corrupt", corrupt))
+			zap.Int("request_num", stats.Total),
+			zap.Float64("corrupt", corruptProb))
 
 		responseBody, err := io.ReadAll(resp.Body)
 		if err != nil {
@@ -417,81 +487,128 @@ func proxyRequest(c *gin.Context, logger *zap.Logger) {
 	}
 }
 
-func shouldTriggerError(errorType string, probability float64, currentIndex int) bool {
-	if probability <= 0 {
-		errorTracker.ErrorBuckets[errorType][currentIndex] = false
-		return false
-	}
-
-	if probability >= 1 {
-		errorTracker.ErrorBuckets[errorType][currentIndex] = true
-		return true
-	}
-
-	errorBucket := errorTracker.ErrorBuckets[errorType]
-	currentCount := countTrueValues(errorBucket)
-	targetCount := int(float64(errorTracker.WindowSize) * probability)
-
-	if currentCount < targetCount {
-		errorBucket[currentIndex] = true
-		return true
-	} else {
-		errorBucket[currentIndex] = false
-		return false
+func updateErrorStats(errorType string, stats *ErrorStats) {
+	switch errorType {
+	case "disconnect":
+		stats.DisconnectCount++
+	case "error500":
+		stats.Error500Count++
+	case "error400":
+		stats.Error400Count++
+	case "no_backend":
+		stats.NoBackendCount++
+	case "corrupt":
+		stats.CorruptCount++
+	case "":
+		stats.SuccessCount++
 	}
 }
 
-func countTrueValues(bucket []bool) int {
+func updateErrorRates(stats *ErrorStats, windowSize int) {
+	recentCount := stats.Total
+	if recentCount > windowSize {
+		recentCount = windowSize
+	}
+
+	stats.RecentTotal = recentCount
+
+	if recentCount == 0 {
+		return
+	}
+
+	disconnectCount := 0
+	error500Count := 0
+	error400Count := 0
+	noBackendCount := 0
+	corruptCount := 0
+
+	for _, errType := range stats.RecentErrors {
+		switch errType {
+		case "disconnect":
+			disconnectCount++
+		case "error500":
+			error500Count++
+		case "error400":
+			error400Count++
+		case "no_backend":
+			noBackendCount++
+		case "corrupt":
+			corruptCount++
+		}
+	}
+
+	stats.CurrentRates["disconnect"] = float64(disconnectCount) / float64(recentCount)
+	stats.CurrentRates["500"] = float64(error500Count) / float64(recentCount)
+	stats.CurrentRates["400"] = float64(error400Count) / float64(recentCount)
+	stats.CurrentRates["no_backend"] = float64(noBackendCount) / float64(recentCount)
+	stats.CurrentRates["corrupt"] = float64(corruptCount) / float64(recentCount)
+}
+
+func countSuccessiveNoErrors(recentErrors []string) int {
 	count := 0
-	for _, v := range bucket {
-		if v {
+	for i := len(recentErrors) - 1; i >= 0; i-- {
+		if recentErrors[i] == "" {
 			count++
+		} else if recentErrors[i] != "" {
+			break
 		}
 	}
 	return count
 }
 
-func calculateCurrentErrorRates() map[string]float64 {
-	rates := make(map[string]float64)
-	windowSize := errorTracker.WindowSize
-	if errorTracker.RequestCounter < windowSize {
-		windowSize = errorTracker.RequestCounter
+func calculateMaxAllowedSuccessive(disconnectProb, error500Prob, error400Prob, noBackendProb, corruptProb float64) int {
+	totalErrorProb := disconnectProb + error500Prob + error400Prob + noBackendProb + corruptProb
+
+	if totalErrorProb <= 0 {
+		return 0
 	}
 
-	if windowSize == 0 {
-		return map[string]float64{
-			"500":        0,
-			"400":        0,
-			"disconnect": 0,
-			"corrupt":    0,
-			"no_backend": 0,
-		}
+	if totalErrorProb >= 1.0 {
+		return 1
 	}
 
-	for errorType, bucket := range errorTracker.ErrorBuckets {
-		trueCount := 0
-		for i := 0; i < windowSize; i++ {
-			if bucket[i] {
-				trueCount++
-			}
-		}
-		rates[errorType] = float64(trueCount) / float64(windowSize)
+	maxSuccessive := int(5.0 / totalErrorProb)
+	if maxSuccessive < 5 {
+		return 5
 	}
 
-	return map[string]float64{
-		"500":        rates["error500"],
-		"400":        rates["error400"],
-		"disconnect": rates["disconnect"],
-		"corrupt":    rates["corrupt"],
-		"no_backend": rates["no_backend"],
+	if maxSuccessive > 20 {
+		return 20
 	}
+
+	return maxSuccessive
 }
 
-func resetErrorTrackers() {
-	errorTracker.RequestCounter = 0
-	for errorType := range errorTracker.ErrorBuckets {
-		errorTracker.ErrorBuckets[errorType] = make([]bool, errorTracker.WindowSize)
+func selectForcedErrorType(disconnectProb, error500Prob, error400Prob, noBackendProb, corruptProb float64) string {
+	totalProb := disconnectProb + error500Prob + error400Prob + noBackendProb + corruptProb
+	if totalProb <= 0 {
+		return ""
 	}
+
+	errorTypes := []string{"disconnect", "error500", "error400", "no_backend", "corrupt"}
+	probabilities := []float64{disconnectProb, error500Prob, error400Prob, noBackendProb, corruptProb}
+
+	randomVal := rand.Float64() * totalProb
+	cumulativeProb := 0.0
+
+	for i, prob := range probabilities {
+		if prob <= 0 {
+			continue
+		}
+
+		cumulativeProb += prob
+		if randomVal < cumulativeProb {
+			return errorTypes[i]
+		}
+	}
+
+	for i := len(probabilities) - 1; i >= 0; i-- {
+		if probabilities[i] > 0 {
+			return errorTypes[i]
+		}
+	}
+
+	return ""
 }
 
 func getEnv(key, fallback string) string {
