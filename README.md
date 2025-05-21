@@ -88,7 +88,7 @@ docker run -p 8080:8080 -p 8070:8070 -e BACKEND_URL=http://your-api-server.com b
 
 # TXN2 Docker Image
 
-- `txn2/bad-proxy:1.0.0`
+- `txn2/bad-proxy:1.2.0`
 
 ## Probability System
 
